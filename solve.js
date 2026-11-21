@@ -3,6 +3,15 @@
 // for field values, quoted fields handled by slicing to the closing quote
 // (doubled quotes and CRs inside quotes are the rare slow path). A field is
 // never built character by character in the common case.
+//
+// Unquoted fields take a fast path driven by a per-line cache: the cache
+// records the current physical line's start/end and whether it holds a stray
+// CR (a CR that is not the line's CRLF terminator). It self-validates on
+// every use (the field's start must lie inside the cached line), so record
+// starts, line breaks and multi-line quoted fields need no explicit
+// invalidation. With a clean line the field end is min(next comma, line
+// end), one slice, no rescans; lines with a stray CR fall back to the
+// original field-by-field CR handling, byte-identical.
 
 // Convert one quoted segment (no quote chars in it) that contains a CR:
 // every CR or CRLF becomes one LF, every LF stays one LF. Returns
@@ -40,6 +49,13 @@ export function run(input) {
   const len = text.length;
   let pos = 0;
   let line = 1;
+  // Per-line cache for the unquoted fast path. lineStart < 0 means invalid.
+  // lineEnd is the offset of the line's LF, or -1 when the line runs to EOF.
+  // lineStray is true when the line holds a CR other than its CRLF
+  // terminator (any CR at all on a line with no LF).
+  let lineStart = -1;
+  let lineEnd = -1;
+  let lineStray = false;
   if (text.charCodeAt(0) === 0xFEFF) pos = 1;
 
   while (true) {
@@ -152,56 +168,83 @@ export function run(input) {
         // ---- Unquoted field (also: junk after a closing quote, and the
         // re-read after an unterminated quote, both with initVal set) ----
         const p = pos;
-        // Only search for the comma in the text: a LF before that comma
-        // shows up inside the sliced field (a short string), so looking
-        // for '\n' in the whole text — which scans to the end of the line
-        // on every field — is never needed. A LF search in the text is
-        // done only when there is no comma left, i.e. once per record.
-        const cIdx = text.indexOf(',', p);
-        let raw;
-        let endKind;
-        if (cIdx !== -1) {
-          raw = text.slice(p, cIdx);
-          const lfIn = raw.indexOf('\n');
-          if (lfIn !== -1) {
-            raw = raw.slice(0, lfIn);
-            pos = p + lfIn + 1;
-            line += 1;
-            endKind = 1;
-          } else {
-            pos = cIdx + 1;
-            endKind = 0;
-          }
+        // (Re)build the per-line cache when the field starts outside it.
+        if (lineStart < 0 || p < lineStart || (lineEnd !== -1 && p >= lineEnd)) {
+          lineStart = text.lastIndexOf('\n', p - 1) + 1;
+          lineEnd = text.indexOf('\n', p);
+          const segEnd = lineEnd === -1 ? len : lineEnd;
+          const rInSeg = text.slice(lineStart, segEnd).indexOf('\r');
+          lineStray = lineEnd === -1 ? rInSeg !== -1 : (rInSeg !== -1 && rInSeg !== segEnd - lineStart - 1);
+        }
+        if (!lineStray) {
+          // Fast path: no stray CR on this line, so the field ends at the
+          // next comma or at the line's LF (or EOF), and a trailing CR is
+          // exactly the CRLF terminator.
+          const cIdx = text.indexOf(',', p);
+          let end;
+          let endKind;
+          if (cIdx !== -1 && (lineEnd === -1 || cIdx < lineEnd)) { end = cIdx; endKind = 0; pos = cIdx + 1; }
+          else if (lineEnd !== -1) { end = lineEnd; endKind = 1; pos = lineEnd + 1; line += 1; }
+          else { end = len; endKind = 2; pos = len; }
+          let sliceEnd = end;
+          if (endKind === 1 && end > p && text.charCodeAt(end - 1) === 13) sliceEnd = end - 1;
+          fval = initVal === '' ? text.slice(p, sliceEnd) : initVal + text.slice(p, sliceEnd);
+          fended = endKind;
+          if (junkFlag && sliceEnd > p) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
         } else {
-          const nIdx = text.indexOf('\n', p);
-          if (nIdx === -1) { raw = text.slice(p, len); pos = len; endKind = 2; }
-          else { raw = text.slice(p, nIdx); pos = nIdx + 1; line += 1; endKind = 1; }
-        }
-        // Any CR in raw is either the CRLF terminator (a trailing CR when
-        // the field ended at LF) or a stray CR. No CR can hide a LF in
-        // the middle: the first LF already ended the field.
-        let cleaned = raw;
-        let added = raw.length;
-        if (raw.indexOf('\r') !== -1) {
-          const trailingCRLF = endKind === 1 && raw.charCodeAt(raw.length - 1) === 13;
-          const limit = trailingCRLF ? raw.length - 1 : raw.length;
-          let parts2 = null;
-          let s = 0;
-          while (true) {
-            const r = raw.indexOf('\r', s);
-            if (r === -1 || r >= limit) break;
-            errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-            if (parts2 === null) parts2 = [];
-            parts2.push(raw.slice(s, r));
-            s = r + 1;
+          // Slow path: the line holds a stray CR; handle it exactly as
+          // before, field by field.
+          // Only search for the comma in the text: a LF before that comma
+          // shows up inside the sliced field (a short string), so looking
+          // for '\n' in the whole text — which scans to the end of the line
+          // on every field — is never needed. A LF search in the text is
+          // done only when there is no comma left, i.e. once per record.
+          const cIdx = text.indexOf(',', p);
+          let raw;
+          let endKind;
+          if (cIdx !== -1) {
+            raw = text.slice(p, cIdx);
+            const lfIn = raw.indexOf('\n');
+            if (lfIn !== -1) {
+              raw = raw.slice(0, lfIn);
+              pos = p + lfIn + 1;
+              line += 1;
+              endKind = 1;
+            } else {
+              pos = cIdx + 1;
+              endKind = 0;
+            }
+          } else {
+            const nIdx = text.indexOf('\n', p);
+            if (nIdx === -1) { raw = text.slice(p, len); pos = len; endKind = 2; }
+            else { raw = text.slice(p, nIdx); pos = nIdx + 1; line += 1; endKind = 1; }
           }
-          if (parts2 === null) cleaned = raw.slice(0, limit);
-          else { parts2.push(raw.slice(s, limit)); cleaned = parts2.join(''); }
-          added = cleaned.length;
+          // Any CR in raw is either the CRLF terminator (a trailing CR when
+          // the field ended at LF) or a stray CR. No CR can hide a LF in
+          // the middle: the first LF already ended the field.
+          let cleaned = raw;
+          let added = raw.length;
+          if (raw.indexOf('\r') !== -1) {
+            const trailingCRLF = endKind === 1 && raw.charCodeAt(raw.length - 1) === 13;
+            const limit = trailingCRLF ? raw.length - 1 : raw.length;
+            let parts2 = null;
+            let s = 0;
+            while (true) {
+              const r = raw.indexOf('\r', s);
+              if (r === -1 || r >= limit) break;
+              errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+              if (parts2 === null) parts2 = [];
+              parts2.push(raw.slice(s, r));
+              s = r + 1;
+            }
+            if (parts2 === null) cleaned = raw.slice(0, limit);
+            else { parts2.push(raw.slice(s, limit)); cleaned = parts2.join(''); }
+            added = cleaned.length;
+          }
+          fval = initVal === '' ? cleaned : initVal + cleaned;
+          fended = endKind;
+          if (junkFlag && added > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
         }
-        fval = initVal === '' ? cleaned : initVal + cleaned;
-        fended = endKind;
-        if (junkFlag && added > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
       }
 
       fields.push(fval);
